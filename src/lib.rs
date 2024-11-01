@@ -3,23 +3,24 @@
 //! version=4 or programatically calling nfs_set_version(nfs, NFS_V4) before
 //! connecting to the server/share.
 //!
-
-#![allow(non_upper_case_globals)]
-
 use libnfs_sys::*;
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString};
 use std::io::{Error, ErrorKind, Result};
 use std::mem::zeroed;
+use std::os::raw::{c_int, c_char};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct NfsPtr(*mut nfs_context);
+
+unsafe impl Send for NfsPtr{}
+unsafe impl Sync for NfsPtr{}
 
 impl Drop for NfsPtr {
     fn drop(&mut self) {
@@ -53,7 +54,7 @@ fn check_retcode(ctx: *mut nfs_context, code: i32) -> Result<()> {
 
 #[derive(Clone)]
 pub struct Nfs {
-    context: Rc<NfsPtr>,
+    context: Arc<NfsPtr>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,13 +71,16 @@ pub enum EntryType {
 impl EntryType {
     fn from(t: ftype3) -> Result<EntryType> {
         match t {
-            ftype3_NF3BLK => Ok(EntryType::Block),
-            ftype3_NF3CHR => Ok(EntryType::Character),
-            ftype3_NF3DIR => Ok(EntryType::Directory),
-            ftype3_NF3REG => Ok(EntryType::File),
-            ftype3_NF3FIFO => Ok(EntryType::NamedPipe),
-            ftype3_NF3LNK => Ok(EntryType::Symlink),
-            ftype3_NF3SOCK => Ok(EntryType::Socket),
+            // explicitly specifying libnfs_sys:: for below cases to get rid of warnings about non-uppercase globals
+            // even though these constants are usable without specifying libnfs_sys:: due to the `use libnfs_sys::*`
+            // for some reason it doesn't work to put #[allow(non_upper_case_globals)] above each case
+            libnfs_sys::ftype3_NF3BLK => Ok(EntryType::Block),
+            libnfs_sys::ftype3_NF3CHR => Ok(EntryType::Character),
+            libnfs_sys::ftype3_NF3DIR => Ok(EntryType::Directory),
+            libnfs_sys::ftype3_NF3REG => Ok(EntryType::File),
+            libnfs_sys::ftype3_NF3FIFO => Ok(EntryType::NamedPipe),
+            libnfs_sys::ftype3_NF3LNK => Ok(EntryType::Symlink),
+            libnfs_sys::ftype3_NF3SOCK => Ok(EntryType::Socket),
             _ => Err(Error::new(
                 ErrorKind::InvalidData,
                 format!("Unknown file type: {}", t),
@@ -110,7 +114,7 @@ pub struct DirEntry {
 
 #[derive(Clone)]
 pub struct NfsDirectory {
-    nfs: Rc<NfsPtr>,
+    nfs: Arc<NfsPtr>,
     handle: *mut nfsdir,
 }
 
@@ -126,7 +130,7 @@ impl Drop for NfsDirectory {
 
 #[derive(Clone)]
 pub struct NfsFile {
-    nfs: Rc<NfsPtr>,
+    nfs: Arc<NfsPtr>,
     handle: *mut nfsfh,
 }
 
@@ -140,11 +144,13 @@ impl Drop for NfsFile {
     }
 }
 
-/*
+
 pub struct NfsUrl<'a> {
+    #[allow(dead_code)] // get rid of warning that field `nfs` is never read
     nfs: &'a mut Nfs,
     url: *mut nfs_url,
 }
+
 
 impl<'a> Drop for NfsUrl<'a> {
     fn drop(&mut self) {
@@ -155,14 +161,14 @@ impl<'a> Drop for NfsUrl<'a> {
         }
     }
 }
-*/
+
 
 impl Nfs {
     pub fn new() -> Result<Self> {
         unsafe {
             let ctx = check_mut_ptr(nfs_init_context())?;
             Ok(Nfs {
-                context: Rc::new(NfsPtr(ctx)),
+                context: Arc::new(NfsPtr(ctx)),
             })
         }
     }
@@ -220,22 +226,21 @@ impl Nfs {
     /// O_SYNC
     /// O_EXCL
     /// O_TRUNC
-    pub fn create(&mut self, path: &Path, flags: OFlag, mode: Mode) -> Result<NfsFile> {
+    pub fn create(&mut self, path: &Path, _flags: OFlag, mode: Mode) -> Result<NfsFile> {
         let path = CString::new(path.as_os_str().as_bytes())?;
         unsafe {
             let mut file_handle: *mut nfsfh = ptr::null_mut();
             check_retcode(
                 self.context.0,
-                nfs_create(
+                nfs_creat(
                     self.context.0,
                     path.as_ptr(),
-                    flags.bits(),
                     mode.bits() as i32,
                     &mut file_handle,
                 ),
             )?;
             Ok(NfsFile {
-                nfs: Rc::clone(&self.context),
+                nfs: Arc::clone(&self.context),
                 handle: file_handle,
             })
         }
@@ -254,7 +259,7 @@ impl Nfs {
     /// Get the maximum supported READ3 size by the server
     pub fn get_readmax(&self) -> Result<u64> {
         unsafe {
-            let max = nfs_get_readmax(self.context.0);
+            let max = nfs_get_readmax(self.context.0) as u64;
             Ok(max)
         }
     }
@@ -262,7 +267,7 @@ impl Nfs {
     /// Get the maximum supported WRITE3 size by the server
     pub fn get_writemax(&self) -> Result<u64> {
         unsafe {
-            let max = nfs_get_writemax(self.context.0);
+            let max = nfs_get_writemax(self.context.0) as u64;
             Ok(max)
         }
     }
@@ -272,7 +277,7 @@ impl Nfs {
         unsafe {
             check_retcode(
                 self.context.0,
-                nfs_lchmod(self.context.0, path.as_ptr(), mode.bits() as i32),
+                nfs_lchmod(self.context.0, path.as_ptr(), mode.bits() as c_int),
             )?;
             Ok(())
         }
@@ -366,7 +371,7 @@ impl Nfs {
                 ),
             )?;
             Ok(NfsFile {
-                nfs: Rc::clone(&self.context),
+                nfs: Arc::clone(&self.context),
                 handle: file_handle,
             })
         }
@@ -381,13 +386,12 @@ impl Nfs {
                 nfs_opendir(self.context.0, path.as_ptr(), &mut dir_handle),
             )?;
             Ok(NfsDirectory {
-                nfs: Rc::clone(&self.context),
+                nfs: Arc::clone(&self.context),
                 handle: dir_handle,
             })
         }
     }
 
-    /*
     /// Parse an NFS URL, but do not split path and file. File
     /// in the resulting struct remains NULL.
     pub fn parse_url_dir(&mut self, url: &str) -> Result<NfsUrl> {
@@ -445,12 +449,27 @@ impl Nfs {
             })
         }
     }
-    */
+    
+
+    pub fn parse_url_mount(&mut self, url: &str) -> Result<()> {
+        unsafe {
+            let ctx =   self.context.0;
+            let n_url = self.parse_url_full(url)?;
+            let url = *n_url.url;
+            let server = url.server;
+            let export = url.path;
+            check_retcode(
+                ctx,
+                nfs_mount(ctx, server, export),
+            )?;
+            Ok(())
+        }
+    }
 
     /*fn convert_cb(
         &self,
-        f: &extern "C" fn(c_int, *mut nfs_context, *mut c_void, *mut c_void) -> (),
-    ) -> unsafe extern "C" fn(c_int, *mut nfs_context, *mut c_void, *mut c_void) {
+        f: &extern "C" fn(c_int, *mut nfs_ctx, *mut c_void, *mut c_void) -> (),
+    ) -> unsafe extern "C" fn(c_int, *mut nfs_ctx, *mut c_void, *mut c_void) {
         *f
     }*/
 
@@ -464,7 +483,7 @@ impl Nfs {
                     self.context.0,
                     path.as_ptr(),
                     buf.as_mut_ptr() as *mut c_char,
-                    buf.len() as i32,
+                    buf.len() as c_int,
                 ),
             )?;
             Ok(())
@@ -525,7 +544,7 @@ impl Nfs {
     /// Modify Connect Parameters
     pub fn set_readahead(&self, size: u32) -> Result<()> {
         unsafe {
-            nfs_set_readahead(self.context.0, size);
+            nfs_set_readmax(self.context.0, size as usize);
         }
         Ok(())
     }
@@ -657,17 +676,24 @@ impl NfsFile {
 
     pub fn pread(&self, count: u64, offset: u64) -> Result<Vec<u8>> {
         let mut buffer: Vec<u8> = Vec::with_capacity(count as usize);
+        let read_size = self.pread_into(count, offset, &mut buffer)?;
+        unsafe {
+            buffer.set_len(read_size as usize);
+        }
+        Ok(buffer)
+    }
+
+    pub fn pread_into(&self, count: u64, offset: u64, buffer: &mut [u8]) -> Result<i32> {
         unsafe {
             let read_size = nfs_pread(
                 self.nfs.0,
                 self.handle,
-                offset,
-                count,
                 buffer.as_mut_ptr() as *mut _,
+                count as usize,
+                offset,
             );
             check_retcode(self.nfs.0, read_size)?;
-            buffer.set_len(read_size as usize);
-            Ok(buffer)
+            Ok(read_size)
         }
     }
 
@@ -676,9 +702,9 @@ impl NfsFile {
             let write_size = nfs_pwrite(
                 self.nfs.0,
                 self.handle,
-                offset,
-                buffer.len() as u64,
                 buffer.as_ptr() as *mut _,
+                buffer.len() as usize,
+                offset,
             );
             check_retcode(self.nfs.0, write_size)?;
             Ok(write_size)
@@ -719,7 +745,7 @@ impl Iterator for NfsDirectory {
                     return Some(Err(e));
                 }
             };
-            let mode = Mode::from_bits_truncate((*dirent).mode);
+            let mode = Mode::from_bits_truncate(((*dirent).mode as u16).into());
             Some(Ok(DirEntry {
                 path: PathBuf::from(file_name.to_string_lossy().into_owned()),
                 inode: (*dirent).inode,
