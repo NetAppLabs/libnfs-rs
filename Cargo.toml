@@ -17,5 +17,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 libc = "~0.2"
-libnfs-sys = "~0.2"
+libnfs-sys = "0.2.4"
 nix = { version = "0.29.0", features = ["fs"] }
+
+[patch.crates-io]
+libnfs-sys = { git = "https://github.com/NetAppLabs/libnfs-sys.git" }
