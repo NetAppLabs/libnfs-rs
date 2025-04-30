@@ -760,6 +760,22 @@ impl NfsFile {
         }
     }
 
+    pub fn get_max_read_size(&self) -> u64 {
+        const MAXIMUM_READ_SIZE: u64 = 4194304; // XXX: according to libnfs, 4 MiB is the maximum
+        const MINIMUM_READ_SIZE: u64 = 8192; // XXX: according to libnfs, 8 KiB is the minimum
+        let ctx_ref = self.nfs.0.lock().unwrap();
+        let ctx = *ctx_ref;
+        unsafe { (nfs_get_readmax(ctx) as u64).min(MAXIMUM_READ_SIZE).max(MINIMUM_READ_SIZE) }
+    }
+
+    fn get_max_write_size(&self) -> usize {
+        const MAXIMUM_WRITE_SIZE: usize = 4194304; // XXX: according to libnfs, 4 MiB is the maximum
+        const MINIMUM_WRITE_SIZE: usize = 8192; // XXX: according to libnfs, 8 KiB is the minimum
+        let ctx_ref = self.nfs.0.lock().unwrap();
+        let ctx = *ctx_ref;
+        unsafe { (nfs_get_writemax(ctx) as usize).min(MAXIMUM_WRITE_SIZE).max(MINIMUM_WRITE_SIZE) }
+    }
+
     pub fn pread(&self, count: u64, offset: u64) -> Result<Vec<u8>> {
         let mut buffer: Vec<u8> = Vec::with_capacity(count as usize);
         let read_size = self.pread_into(count, offset, &mut buffer)?;
@@ -770,34 +786,58 @@ impl NfsFile {
     }
 
     pub fn pread_into(&self, count: u64, offset: u64, buffer: &mut [u8]) -> Result<i32> {
+        let max_read_size = self.get_max_read_size();
         let ctx_ref = self.nfs.0.lock().unwrap();
         let ctx = *ctx_ref;
         unsafe {
-            let read_size = nfs_pread(
-                ctx,
-                self.handle,
-                buffer.as_mut_ptr() as *mut _,
-                count as usize,
-                offset,
-            );
-            check_retcode(ctx, read_size)?;
-            Ok(read_size)
+            let buffer_len = buffer.len();
+            let mut index = 0;
+            let mut offset = offset;
+            let mut remaining = count;
+            while remaining > 0 {
+                let chunk_size = remaining.min(max_read_size);
+                let chunk = &mut buffer[index..buffer_len];
+                let read_size = nfs_pread(
+                    ctx,
+                    self.handle,
+                    chunk.as_mut_ptr() as *mut _,
+                    chunk_size as usize,
+                    offset,
+                );
+                check_retcode(ctx, read_size)?;
+                remaining -= read_size as u64;
+                offset += read_size as u64;
+                index += read_size as usize;
+            }
+            Ok(count as i32)
         }
     }
 
     pub fn pwrite(&self, buffer: &[u8], offset: u64) -> Result<i32> {
+        let max_write_size = self.get_max_write_size();
         let ctx_ref = self.nfs.0.lock().unwrap();
         let ctx = *ctx_ref;
         unsafe {
-            let write_size = nfs_pwrite(
-                ctx,
-                self.handle,
-                buffer.as_ptr() as *mut _,
-                buffer.len() as usize,
-                offset,
-            );
-            check_retcode(ctx, write_size)?;
-            Ok(write_size)
+            let buffer_len = buffer.len();
+            let mut index = 0;
+            let mut offset = offset;
+            let mut remaining = buffer_len;
+            while remaining > 0 {
+                let chunk_size = remaining.min(max_write_size);
+                let chunk = &buffer[index..buffer_len];
+                let write_size = nfs_pwrite(
+                    ctx,
+                    self.handle,
+                    chunk.as_ptr() as *mut _,
+                    chunk_size,
+                    offset,
+                );
+                check_retcode(ctx, write_size)?;
+                remaining -= write_size as usize;
+                offset += write_size as u64;
+                index += write_size as usize;
+            }
+            Ok(buffer_len as i32)
         }
     }
 
